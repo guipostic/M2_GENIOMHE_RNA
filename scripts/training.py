@@ -22,12 +22,6 @@ from Bio import PDB
 # Canonical base-pair labels required by the assignment
 BASE_PAIRS = ['AA', 'AU', 'AC', 'AG', 'UU', 'UC', 'UG', 'CC', 'CG', 'GG']
 
-# Distance bin edges: 0–1, 1–2, ..., 19–20 Å  → 20 intervals
-DISTANCE_BINS = np.linspace(0.0, 20.0, 21)
-N_BINS = len(DISTANCE_BINS) - 1
-
-MAX_SCORE = 10.0
-
 # Map residue names in PDB to canonical A/U/C/G labels
 RESIDUE_NAME_MAP = {
     'A': 'A', 'ADE': 'A', 'DA': 'A',
@@ -75,6 +69,67 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Number of decimal places to round scores (default: 3)."
     )
+    parser.add_argument(
+        "--min-distance",
+        type=float,
+        default=2.0,
+        help="Minimum distance threshold in Angstroms. Distances below this are "
+             "considered steric clashes and will be skipped with a warning (default: 2.0)."
+    )
+    parser.add_argument(
+        "--atom-type",
+        type=str,
+        default="C3'",
+        help="Atom type to use for distance calculations (default: C3'). "
+             "Common options: C3', C4', C5', P (phosphate), C1'."
+    )
+    parser.add_argument(
+        "--density-method",
+        type=str,
+        choices=["histogram", "kde"],
+        default="histogram",
+        help="Density estimation method (default: histogram). "
+             "Options: 'histogram' (discrete binning) or 'kde' (Kernel Density Estimation, smoother). "
+             "Note: KDE is not yet implemented and will fall back to histogram."
+    )
+    parser.add_argument(
+        "--kde-bandwidth",
+        type=float,
+        default=0.5,
+        help="Bandwidth for Gaussian kernel in KDE (default: 0.5 Angstroms). "
+             "Only used if --density-method=kde. Smaller values = more detail, larger = smoother."
+    )
+    parser.add_argument(
+        "--max-distance",
+        type=float,
+        default=20.0,
+        help="Maximum distance to consider in Angstroms (default: 20.0). "
+             "Distances beyond this threshold will be ignored."
+    )
+    parser.add_argument(
+        "--min-seq-sep",
+        type=int,
+        default=4,
+        help="Minimum sequence separation between residues (default: 4). "
+             "Only pairs with |j - i| >= min-seq-sep are considered. "
+             "This filters out residues connected by backbone bonds."
+    )
+    parser.add_argument(
+        "--bin-width",
+        type=int,
+        default=1.0,
+        help="Width of distance bins in Angstroms (default: 1.0). "
+             "Defines the resolution of the discretization step. "
+             "A value of 1.0 is suitable for coarse-grained (C3') models. "
+             "Lower values provide higher resolution but require larger datasets to avoid sparse counts."
+    )
+    parser.add_argument(
+        "--max-score",
+        type=float,
+        default=10.0,
+        help="Maximum penalty score for never-observed distances (default: 10.0). "
+             "Used as a cap for pseudo-energy scores and for steric clash penalties."
+    )
     return parser.parse_args()
 
 
@@ -107,13 +162,19 @@ def calculate_ED(atom1: PDB.Atom.Atom, atom2: PDB.Atom.Atom) -> float:
     return float(np.linalg.norm(v))
 
 
-def extract_c3_atoms(chain: PDB.Chain.Chain) -> List[Tuple[int, PDB.Atom.Atom, str]]:
+def extract_c3_atoms(chain: PDB.Chain.Chain, atom_type: str = "C3'") -> List[Tuple[int, PDB.Atom.Atom, str, float]]:
     """
-    Extract C3' atoms and their residue types (A/U/C/G) from a chain.
+    Extract specific atoms and their residue types (A/U/C/G) from a chain.
 
-    Returns a list of tuples: (sequence_index, atom, base_code)
+    Args:
+        chain: BioPython Chain object
+        atom_type: Name of the atom to extract (default: "C3'")
+
+    Returns:
+        List of tuples: (sequence_index, atom, base_code, bfactor)
+        where bfactor is the temperature factor (reliability indicator).
     """
-    c3_atoms: List[Tuple[int, PDB.Atom.Atom, str]] = []
+    atoms_list: List[Tuple[int, PDB.Atom.Atom, str, float]] = []
     residues = list(chain)  # chain is iterable over residues
 
     for i, residue in enumerate(residues):
@@ -123,14 +184,15 @@ def extract_c3_atoms(chain: PDB.Chain.Chain) -> List[Tuple[int, PDB.Atom.Atom, s
             continue
 
         try:
-            c3_atom = residue["C3'"]
+            target_atom = residue[atom_type]
         except KeyError:
-            # No C3' atom; skip
+            # Atom not found in this residue; skip
             continue
 
-        c3_atoms.append((i, c3_atom, base_code))
+        bfactor = target_atom.get_bfactor()
+        atoms_list.append((i, target_atom, base_code, bfactor))
 
-    return c3_atoms
+    return atoms_list
 
 
 def canonical_pair(res1: str, res2: str) -> str:
@@ -143,38 +205,53 @@ def canonical_pair(res1: str, res2: str) -> str:
 
 
 def update_distance_counts(
-    c3_atoms: List[Tuple[int, PDB.Atom.Atom, str]],
+    c3_atoms: List[Tuple[int, PDB.Atom.Atom, str, float]],
     observed_counts: Dict[str, np.ndarray],
     reference_counts: np.ndarray,
+    distance_bins: np.ndarray,
+    min_distance: float = 2.0,
+    max_distance: float = 20.0,
+    min_seq_sep: int = 4,
 ) -> None:
     """
     Given the C3' atoms for one chain, update the global observed and reference
     distance counts.
 
-    - Only pairs with |j - i| >= 4 are considered.
-    - Only distances < 20.0 Å are considered.
-    - Binning: DISTANCE_BINS defines 20 bins between 0 and 20 Å.
+    - Only pairs with |j - i| >= min_seq_sep are considered.
+    - Only distances >= min_distance and < max_distance are considered.
+    - Distances < min_distance trigger a warning (steric clash).
+    - Binning: Uses provided distance_bins array.
+    - B-factors are extracted but not currently used in scoring.
     """
     n = len(c3_atoms)
+    n_bins = len(distance_bins) - 1
+
     for idx1 in range(n):
-        seq_idx1, atom1, res1 = c3_atoms[idx1]
+        seq_idx1, atom1, res1, bfactor1 = c3_atoms[idx1]
 
         for idx2 in range(idx1 + 1, n):
-            seq_idx2, atom2, res2 = c3_atoms[idx2]
+            seq_idx2, atom2, res2, bfactor2 = c3_atoms[idx2]
 
-            # Sequence separation: |j - i| >= 4
-            if seq_idx2 - seq_idx1 < 4:
+            # Sequence separation: |j - i| >= min_seq_sep
+            if seq_idx2 - seq_idx1 < min_seq_sep:
                 continue
 
             dist = calculate_ED(atom1, atom2)
 
-            # We restrict to [0,20) to stay inside 20 bins cleanly.
-            if dist < 0.0 or dist >= 20.0:
+            # Check for steric clash
+            if dist < min_distance:
+                print(f"[WARN] Steric clash: {res1}{seq_idx1}-{res2}{seq_idx2} "
+                      f"distance = {dist:.2f} Å (< {min_distance:.2f} Å threshold)",
+                      file=sys.stderr)
                 continue
 
-            # Find bin index: 0..19
-            bin_index = int(np.searchsorted(DISTANCE_BINS, dist, side="right") - 1)
-            if bin_index < 0 or bin_index >= N_BINS:
+            # We restrict to [min_distance, max_distance) to stay inside valid range
+            if dist >= max_distance:
+                continue
+
+            # Find bin index
+            bin_index = int(np.searchsorted(distance_bins, dist, side="right") - 1)
+            if bin_index < 0 or bin_index >= n_bins:
                 continue
 
             bp = canonical_pair(res1, res2)
@@ -185,74 +262,145 @@ def update_distance_counts(
             reference_counts[bin_index] += 1
 
 
+def compute_frequency(counts: np.ndarray, pseudo_count: float = 1e-12) -> np.ndarray:
+    """
+    Compute normalized frequencies from observation counts.
+
+    Args:
+        counts: Array of observation counts per bin
+        pseudo_count: Small value to avoid numerical issues (default: 1e-12)
+
+    Returns:
+        Normalized frequency array, or None if no observations
+    """
+    total = float(counts.sum())
+    if total <= 0.0:
+        return None
+
+    frequencies = counts.astype(float) / total
+    # Avoid log(0) by clipping to pseudo_count minimum
+    frequencies = np.clip(frequencies, pseudo_count, None)
+
+    return frequencies
+
+
+def compute_single_score(f_obs: float, f_ref: float, max_score: float) -> float:
+    """
+    Compute pseudo-energy score for a single distance bin.
+
+    Formula: Score = -log(f_obs / f_ref)
+
+    Args:
+        f_obs: Observed frequency in this bin
+        f_ref: Reference frequency in this bin
+        max_score: Maximum penalty score (cap)
+
+    Returns:
+        Pseudo-energy score (capped at max_score)
+    """
+    if f_obs > 0.0 and f_ref > 0.0:
+        val = -log(f_obs / f_ref)
+        return min(val, max_score)
+    else:
+        return max_score
+
+
 def compute_scores(
     observed_counts: Dict[str, np.ndarray],
     reference_counts: np.ndarray,
+    n_bins: int,
     round_decimals: int,
+    distance_bins: np.ndarray,
+    min_distance: float,
+    max_score: float = 10.0,
 ) -> Dict[str, List[float]]:
     """
-    Compute pseudo-energy scores for each base pair and distance bin:
+    Compute pseudo-energy scores for each base pair and distance bin.
 
-        u_bar(i,j,r) = -log( f_obs(i,j,r) / f_ref(r) )
+    Uses Boltzmann inversion: u_bar(i,j,r) = -log( f_obs(i,j,r) / f_ref(r) )
+    where f_obs and f_ref are normalized frequencies.
 
-    where f_obs and f_ref are normalized frequencies in that bin.
+    Bins corresponding to distances < min_distance are forced to max_score
+    (steric clash penalty).
 
-    Returns a dict: {bp: [score_bin_0, ..., score_bin_19]}
+    Returns:
+        Dictionary mapping base pairs to score lists: {bp: [score_bin_0, ..., score_bin_N-1]}
     """
     scores_dict: Dict[str, List[float]] = {}
 
-    ref_total = float(reference_counts.sum())
-    if ref_total <= 0.0:
+    # Calculate bin centers to determine which bins are below min_distance
+    bin_centers = (distance_bins[:-1] + distance_bins[1:]) / 2.0
+
+    # Compute reference frequencies once (used for all base pairs)
+    f_ref_bins = compute_frequency(reference_counts)
+
+    if f_ref_bins is None:
         print("[WARN] Reference counts are all zero; something is wrong.",
               file=sys.stderr)
-        ref_total = 1.0
+        # Fallback: uniform distribution
+        f_ref_bins = np.ones(n_bins) / n_bins
 
-    # Reference frequencies per bin
-    f_ref_bins = reference_counts.astype(float) / ref_total
-    # Avoid log( / 0)
-    f_ref_bins = np.clip(f_ref_bins, 1e-12, None)
-
+    # Compute scores for each base pair
     for bp, counts in observed_counts.items():
-        total_bp = float(counts.sum())
-        if total_bp <= 0.0:
+        f_obs_bins = compute_frequency(counts)
+
+        if f_obs_bins is None:
             # No observations at all for this pair
-            scores_dict[bp] = [MAX_SCORE] * N_BINS
+            scores_dict[bp] = [max_score] * n_bins
             continue
 
-        f_obs_bins = counts.astype(float) / total_bp
-        f_obs_bins = np.clip(f_obs_bins, 0.0, None)
-
-        bp_scores: List[float] = []
-        for r in range(N_BINS):
-            f_obs = f_obs_bins[r]
-            f_ref = f_ref_bins[r]
-
-            if f_obs > 0.0 and f_ref > 0.0:
-                val = -log(f_obs / f_ref)
-                if val > MAX_SCORE:
-                    val = MAX_SCORE
+        # Compute score for each bin using helper function
+        bp_scores = []
+        for r in range(n_bins):
+            # Force steric clash bins (distance < min_distance) to max_score
+            if bin_centers[r] < min_distance:
+                bp_scores.append(round(max_score, round_decimals))
+            # Handle zero reference frequency case  
+            elif reference_counts[r] == 0:
+                bp_scores.append(round(max_score, round_decimals))
             else:
-                val = MAX_SCORE
-
-            bp_scores.append(round(val, round_decimals))
+                score = compute_single_score(f_obs_bins[r], f_ref_bins[r], max_score)
+                bp_scores.append(round(score, round_decimals))
 
         scores_dict[bp] = bp_scores
 
     return scores_dict
 
 
-def save_scores(scores_dict: Dict[str, List[float]], out_dir: str) -> None:
+def save_scores(
+    scores_dict: Dict[str, List[float]],
+    distance_bins: np.ndarray,
+    out_dir: str
+) -> None:
     """
-    Save one file per base pair, each containing 20 lines:
-        line r = score for bin r (0..19).
+    Save one file per base pair with distance and score columns.
+
+    Example output (with bin_width=1.0):
+        # Distance(Å)  Score
+        0.5  10.0
+        1.5  10.0
+        2.5  -0.3
+        ...
+        19.5  0.1
+
+    Args:
+        scores_dict: Dictionary mapping base pairs to score lists
+        distance_bins: Array of bin edges (e.g., [0, 1, 2, ..., 20] for bin_width=1.0)
+        out_dir: Output directory
     """
     os.makedirs(out_dir, exist_ok=True)
+
+    # Calculate bin centers (e.g., 0.5, 1.5, 2.5, ... for bin_width=1.0)
+    bin_centers = (distance_bins[:-1] + distance_bins[1:]) / 2.0
 
     for bp, scores in scores_dict.items():
         out_path = os.path.join(out_dir, f"{bp}.txt")
         with open(out_path, "w") as f:
-            for s in scores:
-                f.write(f"{s}\n")
+            # Write header
+            f.write("# Distance(Å)  Score\n")
+            # Write data
+            for distance, score in zip(bin_centers, scores):
+                f.write(f"{distance:.1f}  {score}\n")
         print(f"[INFO] Wrote {out_path}")
 
 
@@ -270,11 +418,27 @@ def main() -> None:
 
     print(f"[INFO] Found {len(pdb_files)} PDB files.")
 
+    # Check density method
+    if args.density_method == "kde":
+        print("[WARN] KDE is not yet fully implemented. Falling back to histogram method.",
+              file=sys.stderr)
+        print(f"[WARN] Ignoring --kde-bandwidth={args.kde_bandwidth}", file=sys.stderr)
+
+    # Calculate distance bins dynamically based on max_distance
+    num_bins = int((args.max_distance - 0.0) / args.bin_width) + 1
+    distance_bins = np.linspace(0.0, args.max_distance, num_bins)
+    n_bins = len(distance_bins) - 1
+
+    print(f"[INFO] Distance range: 0.0 - {args.max_distance} Å")
+    print(f"[INFO] Number of bins: {n_bins} (bin width: {args.bin_width} Å)")
+    print(f"[INFO] Sequence separation: >= {args.min_seq_sep}")
+    print(f"[INFO] Using atom type: {args.atom_type}")
+
     # Initialize global counts
     observed_counts = {
-        bp: np.zeros(N_BINS, dtype=np.int64) for bp in BASE_PAIRS
+        bp: np.zeros(n_bins, dtype=np.int64) for bp in BASE_PAIRS
     }
-    reference_counts = np.zeros(N_BINS, dtype=np.int64)
+    reference_counts = np.zeros(n_bins, dtype=np.int64)
 
     parser = PDB.PDBParser(QUIET=True)
 
@@ -284,14 +448,30 @@ def main() -> None:
 
         for model in structure:
             for chain in model:
-                c3_atoms = extract_c3_atoms(chain)
+                c3_atoms = extract_c3_atoms(chain, args.atom_type)
                 if not c3_atoms:
                     continue
-                update_distance_counts(c3_atoms, observed_counts, reference_counts)
+                update_distance_counts(
+                    c3_atoms,
+                    observed_counts,
+                    reference_counts,
+                    distance_bins,
+                    args.min_distance,
+                    args.max_distance,
+                    args.min_seq_sep
+                )
 
     # Compute scores and save
-    scores_dict = compute_scores(observed_counts, reference_counts, args.round_decimals)
-    save_scores(scores_dict, args.out_dir)
+    scores_dict = compute_scores(
+        observed_counts,
+        reference_counts,
+        n_bins,
+        args.round_decimals,
+        distance_bins,
+        args.min_distance,
+        args.max_score
+    )
+    save_scores(scores_dict, distance_bins, args.out_dir)
 
 
 if __name__ == "__main__":
