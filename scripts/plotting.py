@@ -21,13 +21,13 @@ def parse_args() -> argparse.Namespace:
         description="Plot RNA distance-based statistical potentials."
     )
     parser.add_argument(
-        "--potentials-dir",
+        "--potentials-dir", "-p",
         type=str,
         default="data/potentials",
         help="Directory containing potential files (*.txt). Default: data/potentials"
     )
     parser.add_argument(
-        "--output-dir",
+        "--output-dir", "-o",
         type=str,
         default="plots",
         help="Directory to save plots. Default: plots"

@@ -59,32 +59,32 @@ def parse_args() -> argparse.Namespace:
         help="PDB files and/or directories containing PDB files."
     )
     parser.add_argument(
-        "--out-dir",
+        "--out-dir", "-o",
         default="potentials",
         help="Output directory for the 10 base-pair potential files (default: potentials)."
     )
     parser.add_argument(
-        "--round-decimals",
+        "--round-decimals", "-r",
         type=int,
         default=3,
         help="Number of decimal places to round scores (default: 3)."
     )
     parser.add_argument(
-        "--min-distance",
+        "--min-distance", "-mind",
         type=float,
         default=2.0,
         help="Minimum distance threshold in Angstroms. Distances below this are "
              "considered steric clashes and will be skipped with a warning (default: 2.0)."
     )
     parser.add_argument(
-        "--atom-type",
+        "--atom-type", "-a",
         type=str,
         default="C3'",
         help="Atom type to use for distance calculations (default: C3'). "
              "Common options: C3', C4', C5', P (phosphate), C1'."
     )
     parser.add_argument(
-        "--density-method",
+        "--density-method", "-dm",
         type=str,
         choices=["histogram", "kde"],
         default="histogram",
@@ -93,21 +93,21 @@ def parse_args() -> argparse.Namespace:
              "Note: KDE is not yet implemented and will fall back to histogram."
     )
     parser.add_argument(
-        "--kde-bandwidth",
+        "--kde-bandwidth", "-kbw",
         type=float,
         default=0.5,
         help="Bandwidth for Gaussian kernel in KDE (default: 0.5 Angstroms). "
              "Only used if --density-method=kde. Smaller values = more detail, larger = smoother."
     )
     parser.add_argument(
-        "--max-distance",
+        "--max-distance", "-maxd",
         type=float,
         default=20.0,
         help="Maximum distance to consider in Angstroms (default: 20.0). "
              "Distances beyond this threshold will be ignored."
     )
     parser.add_argument(
-        "--min-seq-sep",
+        "--min-seq-sep", "-s",
         type=int,
         default=4,
         help="Minimum sequence separation between residues (default: 4). "
@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
              "This filters out residues connected by backbone bonds."
     )
     parser.add_argument(
-        "--bin-width",
+        "--bin-width", "-w",
         type=int,
         default=1.0,
         help="Width of distance bins in Angstroms (default: 1.0). "
@@ -124,7 +124,7 @@ def parse_args() -> argparse.Namespace:
              "Lower values provide higher resolution but require larger datasets to avoid sparse counts."
     )
     parser.add_argument(
-        "--max-score",
+        "--max-score", "-ms",
         type=float,
         default=10.0,
         help="Maximum penalty score for never-observed distances (default: 10.0). "
@@ -212,7 +212,8 @@ def update_distance_counts(
     min_distance: float = 2.0,
     max_distance: float = 20.0,
     min_seq_sep: int = 4,
-) -> None:
+    return_raw_distances: bool = False
+):
     """
     Given the C3' atoms for one chain, update the global observed and reference
     distance counts.
@@ -224,7 +225,13 @@ def update_distance_counts(
     - B-factors are extracted but not currently used in scoring.
     """
     n = len(c3_atoms)
-    n_bins = len(distance_bins) - 1
+    if not return_raw_distances:
+        n_bins = len(distance_bins) - 1
+    
+    if return_raw_distances:
+        raw_distances = {}
+        for bp in BASE_PAIRS:
+            raw_distances[bp] = []
 
     for idx1 in range(n):
         seq_idx1, atom1, res1, bfactor1 = c3_atoms[idx1]
@@ -237,29 +244,37 @@ def update_distance_counts(
                 continue
 
             dist = calculate_ED(atom1, atom2)
+            
+            if return_raw_distances:
+                bp = canonical_pair(res1, res2)
+                if bp in raw_distances:
+                    raw_distances[bp].append(dist)
+            else:
 
-            # Check for steric clash
-            if dist < min_distance:
-                print(f"[WARN] Steric clash: {res1}{seq_idx1}-{res2}{seq_idx2} "
+                # Check for steric clash
+                if dist < min_distance:
+                    print(f"[WARN] Steric clash: {res1}{seq_idx1}-{res2}{seq_idx2} "
                       f"distance = {dist:.2f} Å (< {min_distance:.2f} Å threshold)",
                       file=sys.stderr)
-                continue
+                    continue
 
-            # We restrict to [min_distance, max_distance) to stay inside valid range
-            if dist >= max_distance:
-                continue
+                # We restrict to [min_distance, max_distance) to stay inside valid range
+                if dist >= max_distance:
+                    continue
 
-            # Find bin index
-            bin_index = int(np.searchsorted(distance_bins, dist, side="right") - 1)
-            if bin_index < 0 or bin_index >= n_bins:
-                continue
+                # Find bin index
+                bin_index = int(np.searchsorted(distance_bins, dist, side="right") - 1)
+                if bin_index < 0 or bin_index >= n_bins:
+                    continue
 
-            bp = canonical_pair(res1, res2)
-            if bp in observed_counts:
-                observed_counts[bp][bin_index] += 1
+                bp = canonical_pair(res1, res2)
+                if bp in observed_counts:
+                    observed_counts[bp][bin_index] += 1
 
-            # Reference counts: all pairs (X,X) regardless of type
-            reference_counts[bin_index] += 1
+                # Reference counts: all pairs (X,X) regardless of type
+                reference_counts[bin_index] += 1
+    if return_raw_distances:
+        return raw_distances
 
 
 def compute_frequency(counts: np.ndarray, pseudo_count: float = 1e-12) -> np.ndarray:
@@ -395,7 +410,7 @@ def save_scores(
 
     for bp, scores in scores_dict.items():
         out_path = os.path.join(out_dir, f"{bp}.txt")
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             # Write header
             f.write("# Distance(Å)  Score\n")
             # Write data
