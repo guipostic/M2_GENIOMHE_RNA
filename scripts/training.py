@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "inputs",
         nargs="+",
-        help="PDB files and/or directories containing PDB files."
+        help="PDB/MMCIF files and/or directories containing PDB/MMCIF files."
     )
     parser.add_argument(
         "--out-dir", "-o",
@@ -136,6 +136,7 @@ def parse_args() -> argparse.Namespace:
 def collect_pdb_paths(inputs: List[str]) -> List[str]:
     """
     Expand a list of paths (files or directories) into a flat list of PDB file paths.
+    Support mmcif now: with suffix .cif or .ent
     """
     pdb_paths: List[str] = []
 
@@ -145,7 +146,7 @@ def collect_pdb_paths(inputs: List[str]) -> List[str]:
             for name in os.listdir(path):
                 full = os.path.join(path, name)
                 if os.path.isfile(full) and (
-                    name.lower().endswith(".pdb") or name.lower().endswith(".ent")
+                    name.lower().endswith(".pdb") or name.lower().endswith(".ent") or name.lower().endswith(".cif")
                 ):
                     pdb_paths.append(full)
         elif os.path.isfile(path):
@@ -428,10 +429,10 @@ def main() -> None:
 
     pdb_files = collect_pdb_paths(args.inputs)
     if not pdb_files:
-        print("[ERROR] No valid PDB files found.", file=sys.stderr)
+        print("[ERROR] No valid PDB/MMCIF files found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[INFO] Found {len(pdb_files)} PDB files.")
+    print(f"[INFO] Found {len(pdb_files)} PDB/MMCIF files.")
 
     # Check density method
     if args.density_method == "kde":
@@ -455,10 +456,15 @@ def main() -> None:
     }
     reference_counts = np.zeros(n_bins, dtype=np.int64)
 
-    parser = PDB.PDBParser(QUIET=True)
+    PDBparser = PDB.PDBParser(QUIET=True)
+    CIFparser = PDB.MMCIFParser(QUIET=True)
 
     for pdb_path in pdb_files:
         print(f"[INFO] Processing {pdb_path}")
+        if pdb_path.lower().endswith(".cif") or pdb_path.lower().endswith(".ent"):
+            parser = CIFparser
+        else:
+            parser = PDBparser
         structure = parser.get_structure("RNA", pdb_path)
 
         for model in structure:
