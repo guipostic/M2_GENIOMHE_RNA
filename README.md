@@ -104,6 +104,6 @@ Postic G. (2026). *RNA bioinformatics research projects: briefs and primer.* Mas
 
 ## Licence
 
-[Licence to be chosen. For teaching material, Creative Commons Attribution 4.0 International (CC BY 4.0) is a common choice.]
+Creative Commons Attribution 4.0 International (CC BY 4.0)
 
 The Université Paris-Saclay logo and graphic charter used in the slides belong to the university and are not covered by this licence.
